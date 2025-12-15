@@ -101,6 +101,27 @@ def invalidate_vpn_server_devices_cache_change(vpn_pk):
 
 
 @shared_task(soft_time_limit=7200)
+def invalidate_organization_vpn_cache(organization_id):
+    """
+    Invalidates VPN cache for all VPNs in an organization when
+    organization configuration variables change.
+    """
+    from .controller.views import GetVpnView
+
+    Vpn = load_model("config", "Vpn")
+
+    try:
+        vpn_queryset = Vpn.objects.filter(organization_id=organization_id).only("id")
+        for vpn in vpn_queryset.iterator():
+            GetVpnView.invalidate_get_vpn_cache(vpn)
+            vpn.invalidate_checksum_cache()
+    except Exception as e:
+        logger.error(
+            f"Error invalidating VPN cache for organization {organization_id}: {e}"
+        )
+
+
+@shared_task(soft_time_limit=7200)
 def invalidate_devicegroup_cache_delete(instance_id, model_name, **kwargs):
     from .api.views import DeviceGroupCommonName
 
