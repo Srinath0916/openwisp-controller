@@ -9,13 +9,13 @@ RUN apt update && \
     rm -rf /var/lib/apt/lists/* /root/.cache/pip/* /tmp/*
 
 COPY requirements-test.txt requirements.txt /opt/openwisp/
-RUN pip install -r /opt/openwisp/requirements.txt && \
-    pip install -r /opt/openwisp/requirements-test.txt && \
-    pip install redis && \
+RUN pip install --no-cache-dir -r /opt/openwisp/requirements.txt && \
+    pip install --no-cache-dir -r /opt/openwisp/requirements-test.txt && \
+    pip install --no-cache-dir redis && \
     rm -rf /var/lib/apt/lists/* /root/.cache/pip/* /tmp/*
 
 ADD . /opt/openwisp
-RUN pip install -U /opt/openwisp && \
+RUN pip install -e /opt/openwisp && \
     rm -rf /var/lib/apt/lists/* /root/.cache/pip/* /tmp/*
 
 WORKDIR /opt/openwisp/tests/

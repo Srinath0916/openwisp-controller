@@ -215,3 +215,171 @@ DeviceAdmin.conditional_inlines += [
     CommandInline,
 ]
 DeviceAdmin.add_reversion_following(follow=["deviceconnection_set"])
+
+
+# Mass Command Admin
+MassCommand = swapper.load_model("connection", "MassCommand")
+
+
+class MassCommandForm(forms.ModelForm):
+    class Meta:
+        model = MassCommand
+        fields = ['type', 'input']
+        widgets = {'input': CommandSchemaWidget}
+
+
+@admin.register(MassCommand)
+class MassCommandAdmin(MultitenantAdminMixin, TimeReadonlyAdminMixin, admin.ModelAdmin):
+    list_display = [
+        'id',
+        'target_type',
+        'type',
+        'status',
+        'total_devices',
+        'successful',
+        'failed',
+        'created',
+        'created_by',
+    ]
+    list_filter = [
+        'status',
+        'target_type',
+        'type',
+        MultitenantOrgFilter,
+        'created',
+    ]
+    readonly_fields = [
+        'target_type',
+        'organization',
+        'group',
+        'location',
+        'status',
+        'total_devices',
+        'successful',
+        'failed',
+        'in_progress',
+        'created_by',
+        'created',
+        'modified',
+    ]
+    fields = [
+        'target_type',
+        'organization',
+        'group',
+        'location',
+        'type',
+        'input',
+        'status',
+        'total_devices',
+        'successful',
+        'failed',
+        'in_progress',
+        'created_by',
+        'created',
+        'modified',
+    ]
+    list_select_related = ('organization', 'group', 'location', 'created_by')
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return request.user.is_superuser
+
+
+# Admin action for executing mass commands on selected devices
+class ExecuteMassCommandForm(forms.Form):
+    type = forms.ChoiceField(
+        label=_('Command Type'),
+        choices=[],
+        required=True,
+    )
+    input = forms.JSONField(
+        label=_('Command Input'),
+        required=False,
+        widget=CommandSchemaWidget,
+        help_text=_('JSON input for the command'),
+    )
+
+    def __init__(self, *args, **kwargs):
+        org_id = kwargs.pop('org_id', None)
+        super().__init__(*args, **kwargs)
+        if org_id:
+            self.fields['type'].choices = Command.get_org_allowed_commands(org_id)
+
+
+@admin.action(
+    description=_("Execute command on selected devices"),
+    permissions=['change']
+)
+def execute_mass_command_action(modeladmin, request, queryset):
+    from django.contrib import messages
+    from django.contrib.admin import helpers
+    from django.http import HttpResponseRedirect
+    from django.template.response import TemplateResponse
+    from django.urls import reverse
+
+    org_id = None
+    if queryset:
+        org_id = queryset[0].organization_id
+
+    if not request.user.is_superuser and not request.user.is_manager(org_id):
+        return HttpResponseForbidden()
+
+    if len(queryset) != queryset.filter(organization_id=org_id).count():
+        modeladmin.message_user(
+            request,
+            _("Select devices from one organization"),
+            messages.ERROR,
+        )
+        return HttpResponseRedirect(request.get_full_path())
+
+    if 'apply' in request.POST:
+        form = ExecuteMassCommandForm(data=request.POST, org_id=org_id)
+        if form.is_valid():
+            mass_cmd = MassCommand.objects.create(
+                target_type='manual',
+                type=form.cleaned_data['type'],
+                input=form.cleaned_data.get('input'),
+                created_by=request.user,
+                status='pending',
+            )
+            mass_cmd.devices.set(queryset)
+            mass_cmd.total_devices = queryset.count()
+            mass_cmd.save()
+
+            modeladmin.message_user(
+                request,
+                _(f"Mass command created successfully for {queryset.count()} devices."),
+                messages.SUCCESS,
+            )
+            return HttpResponseRedirect(
+                reverse('admin:connection_masscommand_change', args=[mass_cmd.id])
+            )
+
+    form = ExecuteMassCommandForm(org_id=org_id)
+    context = {
+        'title': _('Execute Command on Selected Devices'),
+        'queryset': queryset,
+        'form': form,
+        'action_checkbox_name': helpers.ACTION_CHECKBOX_NAME,
+        'opts': modeladmin.model._meta,
+        'changelist_url': (
+            f"{request.resolver_match.app_name}:"
+            f"{request.resolver_match.url_name}"
+        ),
+    }
+
+    return TemplateResponse(
+        request,
+        'admin/connection/execute_mass_command.html',
+        context,
+    )
+
+
+# Add the action to DeviceAdmin
+if hasattr(DeviceAdmin, 'actions'):
+    if isinstance(DeviceAdmin.actions, list):
+        DeviceAdmin.actions.append(execute_mass_command_action)
+    else:
+        DeviceAdmin.actions = list(DeviceAdmin.actions) + [execute_mass_command_action]

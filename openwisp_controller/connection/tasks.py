@@ -94,3 +94,49 @@ def launch_command(command_id):
 def auto_add_credentials_to_devices(credential_id, organization_id):
     Credentials = load_model("connection", "Credentials")
     Credentials.auto_add_to_devices(credential_id, organization_id)
+
+
+@shared_task
+def execute_mass_command(mass_command_id):
+    """
+    Executes a mass command by creating individual Command objects
+    for each target device and launching them
+    """
+    MassCommand = load_model("connection", "MassCommand")
+    Command = load_model("connection", "Command")
+
+    try:
+        mass_cmd = MassCommand.objects.get(pk=mass_command_id)
+    except MassCommand.DoesNotExist as e:
+        logger.warning(f'execute_mass_command("{mass_command_id}") failed: {e}')
+        return
+
+    # Update status to in-progress
+    mass_cmd.status = 'in-progress'
+    mass_cmd.save()
+
+    # Get target devices
+    devices = mass_cmd.get_target_devices()
+    mass_cmd.total_devices = devices.count()
+    mass_cmd.save()
+
+    # Create individual commands for each device
+    for device in devices:
+        try:
+            cmd = Command.objects.create(
+                device=device,
+                type=mass_cmd.type,
+                input=mass_cmd.input,
+                mass_command=mass_cmd,
+            )
+            mass_cmd.in_progress += 1
+            mass_cmd.save()
+        except Exception as e:
+            logger.error(f'Failed to create command for device {device.id}: {e}')
+            mass_cmd.failed += 1
+            mass_cmd.save()
+
+    # Check if all commands are done
+    if mass_cmd.in_progress == 0:
+        mass_cmd.status = 'completed'
+        mass_cmd.save()

@@ -1,8 +1,10 @@
 import collections
 import logging
+import uuid
 
 import django
 import jsonschema
+from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import models, transaction
 from django.utils import timezone
@@ -390,6 +392,109 @@ class AbstractDeviceConnection(ConnectorMixin, TimeStampedEditableModel):
         )
 
 
+class AbstractMassCommand(TimeStampedEditableModel):
+    # Override the UUID id from TimeStampedEditableModel with AutoField for SQLite compatibility
+    id = models.AutoField(primary_key=True)
+    TARGET_CHOICES = (
+        ('organization', _('Organization')),
+        ('group', _('Device Group')),
+        ('location', _('Geographic Location')),
+        ('manual', _('Selected Devices')),
+    )
+    STATUS_CHOICES = (
+        ('pending', _('Pending')),
+        ('in-progress', _('In Progress')),
+        ('completed', _('Completed')),
+    )
+    target_type = models.CharField(
+        max_length=20, choices=TARGET_CHOICES, db_index=True
+    )
+    organization = models.ForeignKey(
+        get_model_name('openwisp_users', 'Organization'),
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+    )
+    group = models.ForeignKey(
+        get_model_name('config', 'DeviceGroup'),
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+    )
+    location = models.ForeignKey(
+        get_model_name('geo', 'Location'),
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+    )
+    devices = models.ManyToManyField(
+        get_model_name('config', 'Device'), blank=True
+    )
+    type = models.CharField(
+        max_length=16,
+        choices=(
+            COMMAND_CHOICES
+            if django.VERSION < (5, 0)
+            else get_command_choices
+        ),
+    )
+    input = JSONField(
+        blank=True,
+        null=True,
+        load_kwargs={'object_pairs_hook': collections.OrderedDict},
+        dump_kwargs={'indent': 4},
+    )
+    status = models.CharField(
+        max_length=20, choices=STATUS_CHOICES, default='pending', db_index=True
+    )
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='mass_commands'
+    )
+    total_devices = models.IntegerField(default=0)
+    successful = models.IntegerField(default=0)
+    failed = models.IntegerField(default=0)
+    in_progress = models.IntegerField(default=0)
+
+    class Meta:
+        abstract = True
+        verbose_name = _('Mass Command')
+        verbose_name_plural = _('Mass Commands')
+        ordering = ('-created',)
+
+    def __str__(self):
+        return f'Mass Command #{self.pk} - {self.get_type_display()}'
+
+    def get_target_devices(self):
+        Device = load_model('config', 'Device')
+        if self.target_type == 'organization':
+            return Device.objects.filter(organization=self.organization)
+        elif self.target_type == 'group':
+            return Device.objects.filter(group=self.group)
+        elif self.target_type == 'location':
+            return Device.objects.filter(devicelocation__location=self.location)
+        elif self.target_type == 'manual':
+            return self.devices.all()
+        return Device.objects.none()
+
+    def save(self, *args, **kwargs):
+        """
+        Automatically schedules execution of mass commands
+        in the background upon creation
+        """
+        adding = self._state.adding
+        super().save(*args, **kwargs)
+        if adding and self.status == 'pending':
+            self._schedule_execution()
+
+    def _schedule_execution(self):
+        """
+        Executes execute_mass_command celery task in the background
+        once changes are committed to the database
+        """
+        from ..tasks import execute_mass_command
+        transaction.on_commit(lambda: execute_mass_command.delay(self.pk))
+
+
 class AbstractCommand(TimeStampedEditableModel):
     STATUS_CHOICES = (
         ("in-progress", _("in progress")),
@@ -398,6 +503,22 @@ class AbstractCommand(TimeStampedEditableModel):
     )
     device = models.ForeignKey(
         get_model_name("config", "Device"), on_delete=models.CASCADE
+    )
+    # if the related DeviceConnection is deleted,
+    # set this to NULL to avoid losing history
+    connection = models.ForeignKey(
+        get_model_name("connection", "DeviceConnection"),
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
+    mass_command = models.ForeignKey(
+        get_model_name('connection', 'MassCommand'),
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='commands',
+        help_text=_('Mass command this command belongs to'),
     )
     # if the related DeviceConnection is deleted,
     # set this to NULL to avoid losing history
@@ -661,3 +782,33 @@ class AbstractCommand(TimeStampedEditableModel):
                 f"arguments property is not applicable in "
                 f'command instance of type "{self.type}"'
             )
+
+
+# Signal handler to update MassCommand status when individual commands complete
+from django.db.models.signals import post_save
+from django.dispatch import receiver
+
+
+@receiver(post_save, sender='connection.Command')
+def update_mass_command_status(sender, instance, created, **kwargs):
+    """
+    Updates the MassCommand status counters when an individual command completes
+    """
+    if not instance.mass_command or created:
+        return
+
+    mass_cmd = instance.mass_command
+
+    # Update counters based on command status
+    if instance.status == 'success':
+        mass_cmd.successful += 1
+        mass_cmd.in_progress = max(0, mass_cmd.in_progress - 1)
+    elif instance.status == 'failed':
+        mass_cmd.failed += 1
+        mass_cmd.in_progress = max(0, mass_cmd.in_progress - 1)
+
+    # Check if all commands are done
+    if mass_cmd.in_progress == 0 and (mass_cmd.successful + mass_cmd.failed) == mass_cmd.total_devices:
+        mass_cmd.status = 'completed'
+
+    mass_cmd.save()

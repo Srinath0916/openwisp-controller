@@ -1,3 +1,5 @@
+jsonfield~=3.1.0
+twisted==22.10.0
 django-sortedm2m~=4.0.0
 django-reversion~=6.0.0
 django-taggit~=6.1.0
